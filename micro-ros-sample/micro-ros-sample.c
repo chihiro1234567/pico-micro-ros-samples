@@ -32,11 +32,10 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time)
 {
     // 指定されたパブリッシャーを通して、メッセージ（ここでは std_msgs__msg__Int32 型）を発行します
     rcl_ret_t ret = rcl_publish(&publisher, &msg, NULL);
-    // 送信後に msg.data をインクリメント
-    msg.data++;
     printf("timer callback msg.data = %d\n", msg.data);
     gpio_put(LED_PIN, msg.data % 2);
-    //gpio_put(LED_PIN, 1);
+    // 送信後に msg.data をインクリメント
+    msg.data++;
 }
 
 int main()
@@ -112,7 +111,11 @@ int main()
     // エグゼキューターは、登録されたタイマーやサブスクライバーの
     // コールバックを管理し、定期的に実行します。
     rclc_executor_t executor;
-    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    // エグゼキュータの初期化
+    // rclc_executor_add_timer
+    // 1個のハンドルを管理する
+    int num_of_handles = 1;
+    rclc_executor_init(&executor, &support.context, num_of_handles, &allocator);
     rclc_executor_add_timer(&executor, &timer);
 
     printf("executor start.\n");
