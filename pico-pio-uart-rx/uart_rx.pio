@@ -1,0 +1,103 @@
+.pio_version 0 // only requires PIO version 0
+
+; --------------------------------------
+; uart_rx_mini
+; 最小限の 8n1（8 データビット、1 ストップビット、パリティなし）の 
+; UART 受信機です。スタートビットを検出してから、8 ビット分を所定のタイミングで
+; サンプルし、設定したビット数に達すると自動的に FIFO にプッシュします。
+; --------------------------------------
+.program uart_rx_mini
+
+; Minimum viable 8n1 UART receiver. Wait for the start bit, then sample 8 bits
+; with the correct timing.
+; IN pin 0 is mapped to the GPIO used as UART RX.
+; Autopush must be enabled, with a threshold of 8.
+
+    wait 0 pin 0        ; スタートビット待ち: pin0 が 0（論理低）になるまで待機
+    set x, 7 [10]       ; x レジスタに 7 をセット。さらに [10] により、最初のデータビットの中央まで遅延
+bitloop:                ; 8 回ループ（x = 7～0）
+    in pins, 1          ; 現在のピンの状態（1 ビット）を ISR（入力シフトレジスタ）にシフト
+    jmp x-- bitloop [6] ; x を 1 減らして bitloop にジャンプ。命令後に [6] で遅延（各ループ合計で 8 サイクル）
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void uart_rx_mini_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    // RX用GPIOの設定
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin);
+
+    // PIO ステートマシンの設定を取得（自動生成された関数）
+    pio_sm_config c = uart_rx_mini_program_get_default_config(offset);
+    // WAIT, IN 命令用に使用するピンを設定
+    sm_config_set_in_pins(&c, pin);
+    // シフトは右シフト、autopush 有効（8ビットごとにプッシュ）
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    // SM のクロックは 1 ビット 8 サイクルで動作するため、分周比を設定
+    float div = (float)clock_get_hz(clk_sys) / (8 * baud);
+    sm_config_set_clkdiv(&c, div);
+    
+    // ステートマシンの初期化と有効化
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; --------------------------------------
+; uart_rx
+; uart_rx_mini に加え、ストップビットのチェックなどを行うより堅牢な UART RX 実装
+; --------------------------------------
+.program uart_rx
+
+; Slightly more fleshed-out 8n1 UART receiver which handles framing errors and
+; break conditions more gracefully.
+; IN pin 0 and JMP pin are both mapped to the GPIO used as UART RX.
+
+start:
+    wait 0 pin 0        ; スタートビット（論理0）待ち
+    set x, 7    [10]    ; x に 7 をセットし、最初のデータビットの中央付近まで遅延
+bitloop:
+    in pins, 1          ; 各データビットを ISR にシフト
+    jmp x-- bitloop [6] ; 8 サイクル単位のループで、8 ビット分をサンプリング
+    jmp pin good_stop   ; ストップビットのチェック：RXラインが高（論理1）なら good_stop へ
+                        
+    irq 4 rel           ; ストップビットが低の場合、フレーミングエラーまたはブレーク状態と判断し IRQ 4 を発行
+    wait 1 pin 0        ; ラインがアイドル状態（論理1）になるまで待機
+    jmp start           ; データをプッシュせずに再度スタート位置に戻る
+
+good_stop:
+    push                ; 正常なフレーミングの場合、ISR の内容を FIFO にプッシュ
+
+% c-sdk {
+static inline void uart_rx_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin);
+
+    pio_sm_config c = uart_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin); // WAIT, IN 用
+    sm_config_set_jmp_pin(&c, pin); // JMP 命令でストップビットのチェックに使用
+    // 右シフト、autopush 無効（プッシュはプログラム側で制御）
+    sm_config_set_in_shift(&c, true, false, 32);
+    // FIFO の RX 部分を深く使用（TX は使わないため）
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    // クロック分周設定（1ビット 8 サイクルに合わせる）
+    float div = (float)clock_get_hz(clk_sys) / (8 * baud);
+    sm_config_set_clkdiv(&c, div);
+    
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline char uart_rx_program_getc(PIO pio, uint sm) {
+    // PIO の FIFO は 32bit ですが、受信データは左詰めで入るため、
+    // 上位の 8bit 部分からデータを読み出す
+    io_rw_8 *rxfifo_shift = (io_rw_8*)&pio->rxf[sm] + 3;
+    while (pio_sm_is_rx_fifo_empty(pio, sm))
+        tight_loop_contents();
+    return (char)*rxfifo_shift;
+}
+%}
